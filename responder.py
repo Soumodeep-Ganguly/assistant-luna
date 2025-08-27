@@ -2,8 +2,8 @@ from tts_engine import speak
 from ai_responder import ask_ai
 
 # ---------------- Main Respond ---------------- #
-def respond(command):
-    parsed = ask_ai(command, provider="groq")
+async def respond(command):
+    parsed = await ask_ai(command, provider="groq")
 
     print("DEBUG INFO ", parsed)
 

@@ -10,9 +10,9 @@ from database import init_db, get_config
 
 
 # ---------------- MCP ---------------- #
-from mcp.server import Server
+from fastmcp import FastMCP
 
-server = Server("luna-mcp")
+server = FastMCP("luna-mcp")
 
 @server.tool()
 def open_app(app_name: str):
@@ -35,7 +35,7 @@ def close_tab(tab_id: str):
     return f"Closed tab {tab_id}"
 
 def run_mcp_server():
-    asyncio.run(server.run("localhost", 3001))  # serves on http://localhost:3001
+    server.run(transport="sse", host="127.0.0.1", port=3001)
 
 def start_mcp_background():
     thread = threading.Thread(target=run_mcp_server, daemon=True)
@@ -46,7 +46,7 @@ def start_mcp_background():
 # ---------------- Main Assistant ---------------- #
 load_dotenv()
 
-def main():
+async def main():
     init_db()
 
     # Optional: Set initial config values
@@ -75,7 +75,7 @@ def main():
                     if any(word in command for word in ["shutdown yourself", "stop listening"]):
                         speak("Shutting down. Goodbye.")
                         break
-                    respond(command)
+                    await respond(command)
                 else:
                     silent_mode = True
                     time.sleep(0.5)
@@ -83,4 +83,4 @@ def main():
             speak("Interrupted by user. Exiting.")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

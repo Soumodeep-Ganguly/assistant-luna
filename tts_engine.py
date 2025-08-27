@@ -4,7 +4,7 @@ from kokoro import KPipeline
 # Initialize Kokoro TTS pipeline
 pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
 
-def speak(text: str, voice='af_heart', speed=1.0):
+def speak(text: str, voice='jf_alpha', speed=1.0):
     print(text)  # Also print to console
 
     # Generate and play audio segments
