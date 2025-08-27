@@ -25,6 +25,16 @@ $ conda activate kokoro-env
 - SpeechRecognition
 - ollama (Additionally required to keep running: ollama run gemma3:270m)
 - openai
+- jsonschema
+- pyaudio
+- playsound
+- gtts
+
+Or you can just run
+
+```bash
+$ pip install -r requirements.txt
+```
 
 ### Ollama models that can be used
 

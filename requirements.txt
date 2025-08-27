@@ -1,0 +1,12 @@
+openai
+ollama
+kokoro
+requests
+jsonschema
+pyaudio
+gtts
+playsound
+python-dotenv
+soundfile
+sounddevice
+SpeechRecognition
