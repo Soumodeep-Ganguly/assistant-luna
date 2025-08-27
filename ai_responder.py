@@ -3,13 +3,20 @@ import re
 import os
 from database import get_config
 
-# Import only when needed (lazy imports to avoid unused deps)
+# Lazy import heavy deps
 import ollama
+
+MCP_SERVER_URL = "http://localhost:3001"  # wherever your MCP server runs
 
 try:
     from openai import OpenAI
+    from mcp.client import Client
 except ImportError:
     OpenAI = None
+    Client = None
+
+
+mcp_client = Client(MCP_SERVER_URL) if Client else None
 
 
 # ---------------- JSON Handling ---------------- #
@@ -81,21 +88,28 @@ def ask_ai(command, provider="ollama", model=None):
         user_name = get_config("user_name", "Soumodeep")
         assistant_name = get_config("assistant_name", "Misaki")
 
-        prompt = (
-            "You are a voice assistant. Respond ONLY with a valid JSON object.\n\n"
-            "Your response must include:\n"
-            "- 'reply': a natural language response\n"
-            "- 'action': one of:\n"
-            "     'change_user_name', 'change_assistant_name', 'get_user_name', 'get_assistant_name', "
-            "     'shutdown', 'open_app', 'search_web', 'open_tab', 'close_tab', 'none'\n"
-            "- 'parameters': dictionary of needed data, or {} if none.\n\n"
-            f"User name is '{user_name}'. Assistant name is '{assistant_name}'.\n"
-            "Rules:\n"
-            "- DO NOT include explanations or markdown.\n"
-            "- DO NOT invent unknown values.\n"
-            "- ALWAYS return a single valid JSON object with double quotes.\n"
-            f"User command: {command}"
-        )
+        # Prompt is split: JSON-only for Ollama, tool-aware for others
+        if provider == "ollama":
+            prompt = (
+                "You are a voice assistant. Respond ONLY with a valid JSON object.\n\n"
+                "Your response must include:\n"
+                "- 'reply': a natural language response\n"
+                "- 'action': one of:\n"
+                "     'change_user_name', 'change_assistant_name', 'get_user_name', 'get_assistant_name', "
+                "     'shutdown', 'open_app', 'search_web', 'open_tab', 'close_tab', 'none'\n"
+                "- 'parameters': dictionary of needed data, or {} if none.\n\n"
+                f"User name is '{user_name}'. Assistant name is '{assistant_name}'.\n"
+                "Rules:\n"
+                "- DO NOT include explanations or markdown.\n"
+                "- ALWAYS return a single valid JSON object with double quotes.\n"
+                f"User command: {command}"
+            )
+        else:
+            prompt = (
+                "You are a voice assistant. You can call tools if needed.\n\n"
+                f"User name is '{user_name}'. Assistant name is '{assistant_name}'.\n"
+                f"User command: {command}"
+            )
 
         messages = [{"role": "user", "content": prompt}]
 
@@ -104,38 +118,71 @@ def ask_ai(command, provider="ollama", model=None):
             model = model or "gemma3:1b"
             result = ollama.chat(model=model, messages=messages)
             content = result["message"]["content"]
+            parsed = normalize_response(extract_json(content))
 
-        elif provider == "openai":
+            # If Ollama suggests an action, run it via MCP
+            if parsed["action"] != "none":
+                try:
+                    tool_call = { "name": parsed["action"], "arguments": parsed["parameters"] }
+                    result = mcp_client.execute_tool(tool_call)
+                    parsed["reply"] = str(result)
+                except Exception as e:
+                    parsed["reply"] = f"Failed to execute {parsed['action']}: {e}"
+
+            return parsed
+
+        elif provider in ("openai", "groq", "openrouter"):
             if OpenAI is None:
                 raise ImportError("openai package not installed")
-            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            model = model or "gpt-4o-mini"
-            resp = client.chat.completions.create(model=model, messages=messages)
-            content = resp.choices[0].message.content
 
-        elif provider == "groq":
-            if OpenAI is None:
-                raise ImportError("openai package not installed")
-            client = OpenAI(api_key=os.getenv("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1")
-            model = model or "openai/gpt-oss-20b"
-            resp = client.chat.completions.create(model=model, messages=messages)
-            content = resp.choices[0].message.content
+            if provider == "openai":
+                api_key = os.getenv("OPENAI_API_KEY")
+                base_url = None
+                model = model or "gpt-4o-mini"
+            elif provider == "groq":
+                api_key = os.getenv("GROQ_API_KEY")
+                base_url = "https://api.groq.com/openai/v1"
+                model = model or "openai/gpt-oss-20b"
+            elif provider == "openrouter":
+                api_key = os.getenv("OPENROUTER_API_KEY")
+                base_url = "https://openrouter.ai/api/v1"
+                model = model or "anthropic/claude-3.5-sonnet"
 
-        elif provider == "openrouter":
-            if OpenAI is None:
-                raise ImportError("openai package not installed")
-            client = OpenAI(api_key=os.getenv("OPENROUTER_API_KEY"), base_url="https://openrouter.ai/api/v1")
-            model = model or "anthropic/claude-3.5-sonnet"
-            resp = client.chat.completions.create(model=model, messages=messages)
-            content = resp.choices[0].message.content
+            client = OpenAI(api_key=api_key, base_url=base_url)
 
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=mcp_client.get_tools() if mcp_client else None,
+                tool_choice="auto" if mcp_client else None,
+            )
+
+            msg = response.choices[0].message
+
+            # Check if AI made a tool call
+            if msg.tool_calls:
+                tool_call = msg.tool_calls[0]
+                result = mcp_client.execute_tool(tool_call)
+                return {
+                    "reply": str(result),
+                    "action": tool_call.name,
+                    "parameters": tool_call.arguments,
+                }
+
+            # Fallback normal reply
+            return {
+                "reply": msg.content,
+                "action": "none",
+                "parameters": {},
+            }
+        
         else:
             return {"reply": "Unknown provider.", "action": "none", "parameters": {}}
 
-        # ---------------- Parse JSON ---------------- #
-        parsed = normalize_response(extract_json(content))
-        return parsed
-
     except Exception as e:
         print(f"Error communicating with {provider}: {e}")
-        return {"reply": "There was an error understanding you.", "action": "none", "parameters": {}}
+        return {
+            "reply": "There was an error understanding you.",
+            "action": "none",
+            "parameters": {},
+        }

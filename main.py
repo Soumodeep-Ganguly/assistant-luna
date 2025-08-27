@@ -1,11 +1,49 @@
 import speech_recognition as sr
 from dotenv import load_dotenv
 import time
+import threading
+import asyncio
 from speech_listener import listen_for_command
 from responder import respond
 from tts_engine import speak
 from database import init_db, get_config
 
+
+# ---------------- MCP ---------------- #
+from mcp.server import Server
+
+server = Server("luna-mcp")
+
+@server.tool()
+def open_app(app_name: str):
+    """Open a local application"""
+    return f"App '{app_name}' opened."
+
+@server.tool()
+def search_web(query: str):
+    """Search something on the web"""
+    return f"Results for '{query}' (stubbed)."
+
+@server.tool()
+def open_tab(url: str):
+    """Open a browser tab"""
+    return f"Opened new tab: {url}"
+
+@server.tool()
+def close_tab(tab_id: str):
+    """Close a browser tab"""
+    return f"Closed tab {tab_id}"
+
+def run_mcp_server():
+    asyncio.run(server.run("localhost", 3001))  # serves on http://localhost:3001
+
+def start_mcp_background():
+    thread = threading.Thread(target=run_mcp_server, daemon=True)
+    thread.start()
+    print("✅ MCP server started on http://localhost:3001")
+
+
+# ---------------- Main Assistant ---------------- #
 load_dotenv()
 
 def main():
@@ -16,6 +54,9 @@ def main():
     # set_config("assistant_name", "Zira")
     user_name = get_config("user_name", "Soumodeep")
     assistant_name = get_config("assistant_name", "Misaki")
+
+    # Start MCP server in background
+    start_mcp_background()
 
     print("Voice assistant activated")
     recognizer = sr.Recognizer()

@@ -29,6 +29,7 @@ $ conda activate kokoro-env
 - pyaudio
 - playsound
 - gtts
+- mcp
 
 Or you can just run
 
