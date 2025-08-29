@@ -25,7 +25,7 @@ def get_user_name(_):
 
 
 def get_assistant_name(_):
-    assistant_name = get_config("assistant_name", "Misaki")
+    assistant_name = get_config("assistant_name", "Luna")
     speak(f"My name is {assistant_name}.")
 
 

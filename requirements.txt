@@ -10,4 +10,6 @@ python-dotenv
 soundfile
 sounddevice
 SpeechRecognition
-mcp
+fastmcp
+PySide6 
+numpy

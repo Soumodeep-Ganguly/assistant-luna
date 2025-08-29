@@ -83,7 +83,7 @@ async def ask_ai(command, provider="ollama", model=None):
     try:
         async with mcp_client:
             user_name = get_config("user_name", "Soumodeep")
-            assistant_name = get_config("assistant_name", "Misaki")
+            assistant_name = get_config("assistant_name", "Luna")
 
             # Prompt is split: JSON-only for Ollama, tool-aware for others
             if provider == "ollama":

@@ -29,7 +29,9 @@ $ conda activate kokoro-env
 - pyaudio
 - playsound
 - gtts
-- mcp
+- fastmcp
+- PySide6
+- numpy
 
 Or you can just run
 

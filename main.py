@@ -53,7 +53,7 @@ async def main():
     # set_config("user_name", "Alex")
     # set_config("assistant_name", "Zira")
     user_name = get_config("user_name", "Soumodeep")
-    assistant_name = get_config("assistant_name", "Misaki")
+    assistant_name = get_config("assistant_name", "Luna")
 
     # Start MCP server in background
     start_mcp_background()
