@@ -1,565 +1,679 @@
-import sys
+# luna_ui.py
 import os
+import sys
+import time
+import queue
 import threading
 import asyncio
-import time
 import numpy as np
-from PySide6 import QtCore, QtGui, QtWidgets
-import speech_recognition as sr
-import sounddevice as sd
 
+from PySide6 import QtCore, QtGui, QtWidgets
+
+import sounddevice as sd
+import speech_recognition as sr
+
+from database import get_config, set_config
 from responder import respond
 from tts_engine import speak
-from database import get_config
+from ai_responder import ask_ai
 
-# App name fallback; will be overridden by DB name
-APP_NAME = "Luna AI"
 
 # ------------------------------
-# Helpers (fonts & icons)
+# Visual / color constants
 # ------------------------------
-def load_custom_font():
-    for fname in ["Orbitron-Regular.ttf", "Montserrat-Regular.ttf"]:
-        if os.path.exists(fname):
-            QtGui.QFontDatabase.addApplicationFont(fname)
-            break
+NEON = "#7C3AED"
+NEON_CYAN = "#00E5FF"
+TEXT = "#D7E1EE"
+MUTED = "#9AA6B2"
 
-def make_icon(svg_path: str = None, fallback_char: str = "●", size: int = 24):
-    if svg_path and os.path.exists(svg_path):
-        icon = QtGui.QIcon(svg_path)
-        return icon
-    pix = QtGui.QPixmap(size, size)
-    pix.fill(QtCore.Qt.GlobalColor.transparent)
-    p = QtGui.QPainter(pix)
-    p.setRenderHint(QtGui.QPainter.Antialiasing)
-    font = QtGui.QFont()
-    font.setPointSize(int(size * 0.75))
-    p.setFont(font)
-    p.setPen(QtGui.QPen(QtGui.QColor("#00e5ff")))
-    p.drawText(pix.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, fallback_char)
-    p.end()
-    return QtGui.QIcon(pix)
-
-
-@QtCore.Slot(float)
-def update_wave_level(self, rms: float):
-    self.wave.set_level(rms)
-
-
-@QtCore.Slot(str)
-def append_chat_message(self, msg: str):
-    self.chat_append(msg)
-
-
-# ensure UI returns to ready
-@QtCore.Slot(bool)
-def set_listening_state(self, state: bool):
-    self._set_listening(state)
-    
 
 # ------------------------------
-# Waveform widget (driven by RMS)
+# Helpers
 # ------------------------------
-class WaveformBars(QtWidgets.QWidget):
-    def __init__(self, bars=8, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.setMinimumHeight(48)
-        self.bars = bars
-        self._values = [0.0] * bars
-        self._target = [0.0] * bars
-        self.timer = QtCore.QTimer(self)
-        self.timer.timeout.connect(self._tick)
-        self.timer.start(60)  # 60 ms update
-        self.setVisible(True)
+def ensure_provider_env():
+    """Ensure environment variables reflect the provider/key saved in the DB."""
+    provider = get_config("provider", "ollama")
+    api_key = get_config("api_key", "")
 
-    def start(self):
-        # handled externally; we just ensure timer runs
-        self.setVisible(True)
+    for var in ("OPENAI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY"):
+        os.environ.pop(var, None)
 
-    def stop(self):
-        self._target = [0.0] * self.bars
+    if provider == "openai" and api_key:
+        os.environ["OPENAI_API_KEY"] = api_key
+    elif provider == "groq" and api_key:
+        os.environ["GROQ_API_KEY"] = api_key
+    elif provider == "openrouter" and api_key:
+        os.environ["OPENROUTER_API_KEY"] = api_key
+    # ollama: no env key required
 
-    def set_level(self, rms: float):
-        # map rms (0..1) to bar targets: create a small random distribution around rms
-        base = float(min(max(rms, 0.0), 1.0))
-        for i in range(self.bars):
-            jitter = (i - self.bars/2) / (self.bars*2)
-            self._target[i] = max(0.0, min(1.0, base + jitter * 0.25))
 
-    def _tick(self):
-        # smooth towards target
-        for i in range(self.bars):
-            self._values[i] += (self._target[i] - self._values[i]) * 0.25
-            if abs(self._values[i]) < 0.001:
-                self._values[i] = 0.0
+def nice_name(raw: str, fallback="Luna"):
+    raw = (raw or fallback).strip()
+    return raw[0].upper() + raw[1:] if raw else fallback
+
+
+# ------------------------------
+# Waveform widget (FFT-based bars)
+# ------------------------------
+class WaveBars(QtWidgets.QWidget):
+    def __init__(self, bars=32, parent=None):
+        super().__init__(parent)
+        self._bars = bars
+        self._levels = np.zeros(self._bars, dtype=float)
+        self._active = False
+        self._fade = 0.15
+        self.setMinimumHeight(80)
+
+    def set_active(self, on: bool):
+        self._active = on
+        if not on:
+            self._levels[:] = 0.0
+            self.update()
+
+    def set_levels(self, arr: np.ndarray):
+        if arr is None or not self._active:
+            return
+        # resample arr to self._bars length
+        if len(arr) != self._bars:
+            arr = np.interp(np.linspace(0, 1, self._bars),
+                            np.linspace(0, 1, len(arr)), arr)
+        # smoothing
+        self._levels = (1 - self._fade) * self._levels + self._fade * np.clip(arr, 0.0, 1.0)
         self.update()
 
-    def paintEvent(self, e):
+    def paintEvent(self, ev):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
-        w = self.width()
-        h = self.height()
-        gap = max(2, int(w * 0.008))
-        bar_w = max(4, (w - gap*(self.bars-1)) // self.bars)
-        x = 0
-        for v in self._values:
-            bh = int(h * v)
-            rect = QtCore.QRect(x, h - bh, bar_w, bh)
-            grad = QtGui.QLinearGradient(rect.topLeft(), rect.bottomLeft())
-            grad.setColorAt(0, QtGui.QColor(0, 229, 255, 220))
-            grad.setColorAt(1, QtGui.QColor(167, 139, 250, 200))
-            p.setBrush(QtGui.QBrush(grad))
-            p.setPen(QtCore.Qt.PenStyle.NoPen)
-            r = min(bar_w, 10)
-            p.drawRoundedRect(rect, r, r)
-            x += bar_w + gap
-        p.end()
+        r = self.rect().adjusted(8, 8, -8, -8)
+        w, h = r.width(), r.height()
+        gap = 4
+        barw = max(2, (w - gap * (self._bars - 1)) // self._bars)
+
+        # light background
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setBrush(QtGui.QColor(255, 255, 255, 14))
+        p.drawRoundedRect(r, 8, 8)
+
+        grad = QtGui.QLinearGradient(r.left(), r.top(), r.left(), r.bottom())
+        grad.setColorAt(0, QtGui.QColor(NEON_CYAN))
+        grad.setColorAt(1, QtGui.QColor(NEON))
+        p.setBrush(grad)
+
+        for i, v in enumerate(self._levels):
+            bh = int(v * h)
+            rect = QtCore.QRect(r.left() + i * (barw + gap), r.bottom() - bh, barw, bh)
+            p.drawRoundedRect(rect, 4, 4)
+
 
 # ------------------------------
-# Main Window
+# Mic level worker: emits FFT / band values
+# ------------------------------
+class MicLevelWorker(QtCore.QThread):
+    levels = QtCore.Signal(np.ndarray)
+
+    def __init__(self, bars=32, parent=None, device=None):
+        super().__init__(parent)
+        self._bars = bars
+        self._stop = threading.Event()
+        self._device = device
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        def callback(indata, frames, t, status):
+            if self._stop.is_set():
+                return
+            try:
+                mono = np.mean(indata, axis=1)
+                spec = np.abs(np.fft.rfft(mono))
+                if spec.size == 0:
+                    return
+                spec = spec / (spec.max() + 1e-9)
+                # map to bars (log spacing)
+                bins = np.logspace(0, np.log10(len(spec)), self._bars + 1, base=10.0) - 1
+                bins = np.clip(bins.astype(int), 0, len(spec) - 1)
+                out = []
+                for i in range(self._bars):
+                    a = bins[i]
+                    b = bins[i + 1] if i + 1 < len(bins) else len(spec) - 1
+                    out.append(float(np.max(spec[a:b + 1])) if b >= a else 0.0)
+                self.levels.emit(np.array(out, dtype=float))
+            except Exception:
+                pass
+
+        try:
+            with sd.InputStream(callback=callback, channels=1, samplerate=16000, blocksize=1024,
+                                device=self._device):
+                while not self._stop.is_set():
+                    time.sleep(0.05)
+        except Exception:
+            # device busy or unavailable -> silent exit
+            pass
+
+
+# ------------------------------
+# SettingsDialog (provider + API key) with robust validation
+# ------------------------------
+class SettingsDialog(QtWidgets.QDialog):
+    validationResult = QtCore.Signal(bool, str)  # emitted from worker thread -> _on_validation_result
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings - Provider & API Key")
+        self.setModal(True)
+        self.setFixedWidth(480)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(QtWidgets.QLabel("Select provider and add API key (if required)"))
+
+        self.provider = QtWidgets.QComboBox()
+        self.provider.addItems(["ollama", "openai", "groq", "openrouter"])
+        self.provider.setCurrentText(get_config("provider", "ollama"))
+        layout.addWidget(QtWidgets.QLabel("Provider:"))
+        layout.addWidget(self.provider)
+
+        self.api_key = QtWidgets.QLineEdit()
+        self.api_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.api_key.setPlaceholderText("API key (leave blank for Ollama)")
+        self.api_key.setText(get_config("api_key", ""))
+        layout.addWidget(QtWidgets.QLabel("API Key:"))
+        layout.addWidget(self.api_key)
+
+        self.info = QtWidgets.QLabel("")
+        self.info.setStyleSheet(f"color: {MUTED}")
+        layout.addWidget(self.info)
+
+        btns = QtWidgets.QHBoxLayout()
+        self.save_btn = QtWidgets.QPushButton("Validate & Save")
+        self.cancel_btn = QtWidgets.QPushButton("Cancel")
+        btns.addStretch(1)
+        btns.addWidget(self.cancel_btn)
+        btns.addWidget(self.save_btn)
+        layout.addLayout(btns)
+
+        self.save_btn.clicked.connect(self._on_save)
+        self.cancel_btn.clicked.connect(self.reject)
+        self.validationResult.connect(self._on_validation_result)
+
+    def _on_save(self):
+        provider = self.provider.currentText()
+        key = self.api_key.text().strip()
+
+        self.info.setText("Validating…")
+        self.save_btn.setEnabled(False)
+
+        def worker():
+            prev_env = dict(os.environ)
+            try:
+                # set env for ask_ai to pick up
+                for v in ("OPENAI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY"):
+                    os.environ.pop(v, None)
+                if provider == "openai" and key:
+                    os.environ["OPENAI_API_KEY"] = key
+                elif provider == "groq" and key:
+                    os.environ["GROQ_API_KEY"] = key
+                elif provider == "openrouter" and key:
+                    os.environ["OPENROUTER_API_KEY"] = key
+
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    # ask_ai is used for validation as requested
+                    result = loop.run_until_complete(ask_ai("ping", provider=provider, model=None))
+                finally:
+                    loop.close()
+
+                # result must be dict and have a non-error reply
+                ok = False
+                msg = "Validation failed"
+                if isinstance(result, dict) and "reply" in result:
+                    reply = (result.get("reply") or "").strip()
+                    rlow = reply.lower()
+                    # treat typical error phrases as failure
+                    bad_phrases = [
+                        "there was an error", "sorry, i didn't understand", "invalid", "could not",
+                        "error", "no response", "invalid json", "invalid json returned"
+                    ]
+                    if reply and not any(b in rlow for b in bad_phrases) and len(reply) > 2:
+                        ok = True
+                        msg = f"Validated — provider '{provider}' looks good."
+                    else:
+                        msg = f"Validation failed: assistant reply: '{reply}'"
+                else:
+                    msg = f"Validation failed: unexpected response."
+
+                if ok:
+                    # Save
+                    set_config("provider", provider)
+                    set_config("api_key", key if provider != "ollama" else "")
+                self.validationResult.emit(ok, msg)
+            except Exception as e:
+                self.validationResult.emit(False, f"Validation exception: {e}")
+            finally:
+                os.environ.clear()
+                os.environ.update(prev_env)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @QtCore.Slot(bool, str)
+    def _on_validation_result(self, ok: bool, msg: str):
+        self.save_btn.setEnabled(True)
+        self.info.setText(msg)
+        if ok:
+            self.accept()
+
+
+# ------------------------------
+# Main LunaUI
 # ------------------------------
 class LunaUI(QtWidgets.QMainWindow):
-    micPressed = QtCore.Signal()
-    micMuted = QtCore.Signal()
-    micStopped = QtCore.Signal()
+    # thread-safe UI signals
+    appendChat = QtCore.Signal(str)
+    setListening = QtCore.Signal(bool)
+    setSpeaking = QtCore.Signal(bool)
+    setMicLevels = QtCore.Signal(np.ndarray)
 
     def __init__(self):
         super().__init__()
-
-        # Load assistant name from DB (capitalize first char)
-        assistant_name = get_config("assistant_name", "Luna") or "Luna"
-        assistant_name = assistant_name.strip()
-        if assistant_name:
-            title_name = assistant_name[0].upper() + assistant_name[1:]
-        else:
-            title_name = "Luna"
-
-        self.setWindowTitle(title_name + " AI")
+        self.resize(1000, 680)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowFlags(
-            QtCore.Qt.WindowType.FramelessWindowHint
-            | QtCore.Qt.WindowType.WindowSystemMenuHint
-            | QtCore.Qt.WindowType.WindowMinMaxButtonsHint
+            QtCore.Qt.WindowType.FramelessWindowHint |
+            QtCore.Qt.WindowType.WindowSystemMenuHint
         )
-        self.resize(980, 640)
 
-        # central widget
-        self.bg = QtWidgets.QWidget()
-        self.bg.setObjectName("bg")
-        self.setCentralWidget(self.bg)
-        self.vbox = QtWidgets.QVBoxLayout(self.bg)
-        self.vbox.setContentsMargins(18, 18, 18, 18)
-        self.vbox.setSpacing(10)
+        assistant = nice_name(get_config("assistant_name", "Luna"), "Luna")
+        self.setWindowTitle(f"{assistant} AI")
 
-        # title + close button row
-        titleRow = QtWidgets.QHBoxLayout()
-        self.title = QtWidgets.QLabel(title_name)
-        self.title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.title.setObjectName("title")
-        self.title.setMinimumHeight(56)
+        # UI layout (keeps the futuristic look you already had)
+        root = QtWidgets.QWidget()
+        self.setCentralWidget(root)
+        v = QtWidgets.QVBoxLayout(root)
+        v.setContentsMargins(12, 12, 12, 12)
 
-        # close button top-right
-        self.closeBtn = QtWidgets.QPushButton()
-        self.closeBtn.setFixedSize(30, 30)
-        self.closeBtn.setIcon(make_icon(fallback_char="✕", size=18))
-        self.closeBtn.setObjectName("closeBtn")
-        self.closeBtn.setToolTip("Close")
-        self.closeBtn.clicked.connect(self._close_pressed)
+        # title row
+        tr = QtWidgets.QHBoxLayout()
+        self.settingsBtn = QtWidgets.QPushButton("⚙")
+        self.settingsBtn.setFixedSize(34, 34)
+        self.settingsBtn.clicked.connect(self.open_settings)
 
-        titleRow.addWidget(self.title, 1)
-        titleRow.addWidget(self.closeBtn, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.titleLabel = QtWidgets.QLabel(assistant)
+        self.titleLabel.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.titleLabel.setObjectName("title")
 
-        # Chat area + input
+        self.closeBtn = QtWidgets.QPushButton("✕")
+        self.closeBtn.setFixedSize(34, 34)
+        self.closeBtn.clicked.connect(self._close_app)
+
+        tr.addWidget(self.settingsBtn)
+        tr.addWidget(self.titleLabel, 1)
+        tr.addWidget(self.closeBtn)
+
+        v.addLayout(tr)
+
+        # chat
         self.chat = QtWidgets.QTextEdit()
         self.chat.setReadOnly(True)
-        self.chat.setObjectName("chat")
-        self.chat.setPlaceholderText("Conversation will appear here...")
+        v.addWidget(self.chat, 1)
 
+        # input
         self.input = QtWidgets.QLineEdit()
-        self.input.setObjectName("input")
-        self.input.setPlaceholderText("Type to Luna and press Enter…")
+        self.input.setPlaceholderText("Type here and press Enter…")
         self.input.returnPressed.connect(self._send_text)
+        v.addWidget(self.input)
 
-        # Listening status + waveform
-        self.listeningRow = QtWidgets.QHBoxLayout()
-        self.listeningLbl = QtWidgets.QLabel("Ready.")
-        self.listeningLbl.setObjectName("listening")
-        self.wave = WaveformBars()
-        self.wave.setFixedHeight(48)
-        self.listeningRow.addWidget(self.listeningLbl, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
-        self.listeningRow.addWidget(self.wave, 1)
-
-        # Bottom controls
-        self.controls = QtWidgets.QWidget()
-        self.controls.setObjectName("controls")
-        self.controlsLayout = QtWidgets.QHBoxLayout(self.controls)
-        self.controlsLayout.setContentsMargins(0, 6, 0, 0)
-        self.controlsLayout.addStretch(1)
-
-        self.micBtn = QtWidgets.QPushButton()
-        self.micBtn.setObjectName("micBtn")
-        self.micBtn.setIcon(make_icon(fallback_char="🎤"))
-        self.micBtn.setIconSize(QtCore.QSize(36, 36))
-        self.micBtn.setFixedSize(80, 80)
-        self.micBtn.clicked.connect(self.on_mic_pressed)
-
+        # controls (mute + mic)
+        controls = QtWidgets.QHBoxLayout()
+        controls.addStretch(1)
         self.muteBtn = QtWidgets.QPushButton()
-        self.muteBtn.setObjectName("muteBtn")
-        self.muteBtn.setIcon(make_icon(fallback_char="🔇"))
-        self.muteBtn.setIconSize(QtCore.QSize(22, 22))
         self.muteBtn.setFixedSize(48, 48)
         self.muteBtn.clicked.connect(self.on_mic_muted)
+        controls.addWidget(self.muteBtn)
+        self.manualMicBtn = QtWidgets.QPushButton("🎤")
+        self.manualMicBtn.setFixedSize(56, 56)
+        self.manualMicBtn.clicked.connect(self._manual_capture)
+        controls.addWidget(self.manualMicBtn)
+        controls.addStretch(1)
+        v.addLayout(controls)
 
-        self.stopBtn = QtWidgets.QPushButton()
-        self.stopBtn.setObjectName("stopBtn")
-        self.stopBtn.setIcon(make_icon(fallback_char="⏹"))
-        self.stopBtn.setIconSize(QtCore.QSize(24, 24))
-        self.stopBtn.setFixedSize(48, 48)
-        self.stopBtn.clicked.connect(self.on_mic_stopped)
+        # waveform
+        self.wave = WaveBars(bars=32)
+        v.addWidget(self.wave)
 
-        self.controlsLayout.addWidget(self.muteBtn)
-        self.controlsLayout.addWidget(self.micBtn)
-        self.controlsLayout.addWidget(self.stopBtn)
-        self.controlsLayout.addStretch(1)
+        # style (keeps neon look)
+        self.setStyleSheet(f"""
+            #title {{ color: {NEON_CYAN}; font: 700 26px 'Orbitron'; text-shadow: 0 0 10px {NEON_CYAN}; }}
+            QTextEdit {{ background: rgba(255,255,255,0.04); color: {TEXT}; border-radius: 10px; padding: 10px; }}
+            QLineEdit {{ background: rgba(255,255,255,0.03); color: {TEXT}; border-radius: 8px; padding: 10px; }}
+            QPushButton {{ background: rgba(255,255,255,0.03); color: {TEXT}; border-radius: 10px; }}
+            QPushButton:hover {{ border: 1px solid {NEON_CYAN}; }}
+        """)
 
-        # layout add
-        self.vbox.addLayout(titleRow)
-        self.vbox.addWidget(self.chat, 1)
-        self.vbox.addWidget(self.input)
-        self.vbox.addLayout(self.listeningRow)
-        self.vbox.addWidget(self.controls)
+        # internal state / threads
+        self._stt_queue = queue.Queue()
+        self._stt_running = True
+        self._bg_stop = None
+        self._mic_worker = None
+        self._stt_thread = threading.Thread(target=self._stt_processor, daemon=True)
+        self._stt_thread.start()
 
-        # Drag to move
-        self._drag_pos = None
+        # signals
+        self.appendChat.connect(self.chat.append)
+        self.setListening.connect(self._apply_listening)
+        self.setSpeaking.connect(self._apply_speaking)
+        self.setMicLevels.connect(self.wave.set_levels)
 
-        # audio monitoring state
-        self._listening_stream = None
-        self._listening_lock = threading.Lock()
-        self._current_rms = 0.0
-        self._running = True
-        self._is_listening = False
-        self._is_speaking = False
+        # initialize mute state and start always-listen if not muted
+        muted = get_config("muted", False)
+        self._apply_mute_ui(muted)
+        if not muted:
+            # ensure provider env is set first
+            if get_config("provider"):
+                ensure_provider_env()
+            self.start_background_listening()
 
-        # animations & style
-        self._init_animations()
-        load_custom_font()
-        self._apply_style()
+        # welcome
+        user = nice_name(get_config("user_name", "User"), "User")
+        self.appendChat.emit(f"✨ Welcome, {user}. Listening automatically (unless muted).")
 
     # ------------------------------
-    # Close handling
+    # settings dialog
     # ------------------------------
-    def _close_pressed(self):
-        self._running = False
-        # stop any running streams
+    def open_settings(self):
+        dlg = SettingsDialog(self)
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            # refresh provider env if saved
+            ensure_provider_env()
+            # if not muted, ensure background listening is running
+            if not get_config("muted", False):
+                self.start_background_listening()
+
+    # ------------------------------
+    # background listening control
+    # ------------------------------
+    def start_background_listening(self):
+        if self._bg_stop is not None:
+            return  # already running
         try:
-            if self._listening_stream is not None:
-                self._listening_stream.stop()
-                self._listening_stream.close()
+            self._bg_recognizer = sr.Recognizer()
+            self._bg_mic = sr.Microphone()
+            # start mic worker for waveform
+            self._start_mic_worker()
+            # start background listener; returned function stops it
+            self._bg_stop = self._bg_recognizer.listen_in_background(self._bg_mic,
+                                                                      self._bg_callback,
+                                                                      phrase_time_limit=8)
+            self.setListening.emit(True)
+        except Exception as e:
+            self.appendChat.emit(f"⚠️ Cannot start background listening: {e}")
+
+    def stop_background_listening(self):
+        if self._bg_stop is None:
+            return
+        try:
+            self._bg_stop(wait_for_stop=False)
+        except Exception:
+            try:
+                self._bg_stop()
+            except Exception:
+                pass
+        self._bg_stop = None
+        self.setListening.emit(False)
+        # clear queue (optional)
+        with self._stt_queue.mutex:
+            self._stt_queue.queue.clear()
+
+    def _bg_callback(self, recognizer, audio):
+        # called on listen_in_background thread; push audio to queue for sequential processing
+        try:
+            self._stt_queue.put(audio)
         except Exception:
             pass
-        QtWidgets.QApplication.quit()
 
     # ------------------------------
-    # Integration Hooks (connect your backend here)
+    # STT processing worker
     # ------------------------------
-    def on_mic_pressed(self):
-        # Start visualization stream
-        self._start_mic_stream()
-        self._set_listening(True)
-        self._pulse_on(True)
-        self.chat_append("🟣 Luna: Listening…")
-
-        # Speech recognition happens in a background thread (blocking)
-        def run_stt():
-            recognizer = sr.Recognizer()
-            with sr.Microphone() as mic:
+    def _stt_processor(self):
+        """Background thread: read audio from queue, recognition + respond sequentially."""
+        while self._stt_running:
+            try:
+                audio = None
                 try:
-                    audio = recognizer.listen(mic, timeout=6, phrase_time_limit=12)
-                    # stop mic stream after capture so RMS resets when not speaking
-                    self._stop_mic_stream()
-                    command = recognizer.recognize_google(audio)
-                    QtCore.QMetaObject.invokeMethod(
-                        self,
-                        lambda: self.chat_append(f"🧑 You: {command}"),
-                        QtCore.Qt.ConnectionType.QueuedConnection
-                    )
-                    # Send to backend asyncio respond
+                    audio = self._stt_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if audio is None:
+                    continue
+                # recognition (use a fresh Recognizer instance to be safe)
+                r = sr.Recognizer()
+                try:
+                    text = r.recognize_google(audio)
+                except sr.UnknownValueError:
+                    self.appendChat.emit("⚠️ Could not understand audio.")
+                    continue
+                except sr.RequestError as e:
+                    self.appendChat.emit(f"⚠️ STT request failed: {e}")
+                    continue
+
+                # push user text to chat
+                self.appendChat.emit(f"🧑 You (voice): {text}")
+
+                # call backend (use saved provider env)
+                try:
+                    ensure_provider_env()
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
-                    res = loop.run_until_complete(respond(command))
-                    loop.close()
-                    QtCore.QMetaObject.invokeMethod(
-                        self,
-                        lambda: self.chat_append(f"🟣 {get_config('assistant_name','Luna').capitalize()}: {res}"),
-                        QtCore.Qt.ConnectionType.QueuedConnection
-                    )
-                    # While speaking, pass audio chunks callback to animate bars
-                    def ui_chunk_callback(arr):
-                        # compute RMS of TTS audio chunk
-                        rms = float(np.sqrt(np.mean(np.square(arr))))
-                        QtCore.QMetaObject.invokeMethod(self, lambda: self.wave.set_level(rms), QtCore.Qt.ConnectionType.QueuedConnection)
-
-                    # call speak (synchronous) but with visualization callback
-                    speak(res, on_audio_chunk=ui_chunk_callback)
-                except sr.WaitTimeoutError:
-                    # no speech captured
-                    self._stop_mic_stream()
-                    QtCore.QMetaObject.invokeMethod(self, lambda: self.chat_append("⚠️ No speech detected."), QtCore.Qt.ConnectionType.QueuedConnection)
-                except sr.UnknownValueError:
-                    self._stop_mic_stream()
-                    QtCore.QMetaObject.invokeMethod(
-                        self, "append_chat_message",
-                        QtCore.Qt.ConnectionType.QueuedConnection,
-                        QtCore.Q_ARG(str, "⚠️ Could not understand audio.")
-                    )
-                except sr.RequestError as e:
-                    self._stop_mic_stream()
-                    QtCore.QMetaObject.invokeMethod(self, lambda: self.chat_append(f"⚠️ STT error: {e}"), QtCore.Qt.ConnectionType.QueuedConnection)
+                    try:
+                        reply = loop.run_until_complete(respond(text))
+                    finally:
+                        loop.close()
                 except Exception as e:
-                    self._stop_mic_stream()
-                    QtCore.QMetaObject.invokeMethod(self, lambda: self.chat_append(f"⚠️ Error: {e}"), QtCore.Qt.ConnectionType.QueuedConnection)
+                    self.appendChat.emit(f"⚠️ Assistant error: {e}")
+                    continue
+
+                self.appendChat.emit(f"🤖 {nice_name(get_config('assistant_name', 'Luna'))}: {reply}")
+
+                # visualize speaking and speak
+                self.setSpeaking.emit(True)
+                try:
+                    # If your tts_engine.speak provides audio-chunk callback you can hook it here
+                    speak(reply)
+                except Exception as e:
+                    self.appendChat.emit(f"⚠️ TTS error: {e}")
                 finally:
-                    QtCore.QMetaObject.invokeMethod(
-                        self, "set_listening_state",
-                        QtCore.Qt.ConnectionType.QueuedConnection,
-                        QtCore.Q_ARG(bool, False)
-                    )
-                    QtCore.QMetaObject.invokeMethod(self, lambda: self._pulse_on(False), QtCore.Qt.ConnectionType.QueuedConnection)
+                    self.setSpeaking.emit(False)
 
-        threading.Thread(target=run_stt, daemon=True).start()
+            except Exception:
+                # safety: don't let thread die
+                time.sleep(0.1)
+                continue
 
+    # ------------------------------
+    # mic worker control (waveform)
+    # ------------------------------
+    def _start_mic_worker(self):
+        if self._mic_worker is not None:
+            return
+        self._mic_worker = MicLevelWorker(bars=32)
+        self._mic_worker.levels.connect(lambda arr: self.setMicLevels.emit(arr))
+        self._mic_worker.start()
+
+    def _stop_mic_worker(self):
+        if self._mic_worker is None:
+            return
+        try:
+            self._mic_worker.stop()
+            self._mic_worker.wait(500)
+        except Exception:
+            pass
+        self._mic_worker = None
+        # flatten bars
+        self.wave.set_active(False)
+
+    # ------------------------------
+    # UI slots
+    # ------------------------------
+    @QtCore.Slot(bool)
+    def _apply_listening(self, on: bool):
+        # start/stop mic worker according to listening state
+        if on:
+            self.wave.set_active(True)
+            if self._mic_worker is None:
+                self._start_mic_worker()
+            self.muteBtn.setToolTip("Mute (stop automatic listening)")
+        else:
+            # stop mic worker
+            self.wave.set_active(False)
+            self._stop_mic_worker()
+            self.muteBtn.setToolTip("Unmute (resume automatic listening)")
+
+    @QtCore.Slot(bool)
+    def _apply_speaking(self, on: bool):
+        self.wave.set_active(on or (self._bg_stop is not None))
+
+    # ------------------------------
+    # manual mic button (one-shot)
+    # ------------------------------
+    def _manual_capture(self):
+        # if background listening active, do nothing (to avoid duplicate)
+        if self._bg_stop is not None:
+            self.appendChat.emit("ℹ️ Always-listen is active — manual capture skipped.")
+            return
+
+        def one_shot():
+            r = sr.Recognizer()
+            with sr.Microphone() as src:
+                r.adjust_for_ambient_noise(src, duration=0.5)
+                self.appendChat.emit("🎧 Listening (manual)…")
+                try:
+                    audio = r.listen(src, timeout=6, phrase_time_limit=8)
+                except Exception as e:
+                    self.appendChat.emit(f"⚠️ Manual capture failed: {e}")
+                    return
+
+            try:
+                text = r.recognize_google(audio)
+                self.appendChat.emit(f"🧑 You (manual): {text}")
+            except sr.UnknownValueError:
+                self.appendChat.emit("⚠️ Could not understand audio.")
+                return
+            except sr.RequestError as e:
+                self.appendChat.emit(f"⚠️ STT request failed: {e}")
+                return
+
+            # respond
+            ensure_provider_env()
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    reply = loop.run_until_complete(respond(text))
+                finally:
+                    loop.close()
+            except Exception as e:
+                self.appendChat.emit(f"⚠️ Assistant error: {e}")
+                return
+
+            self.appendChat.emit(f"🤖 {nice_name(get_config('assistant_name','Luna'))}: {reply}")
+            self.setSpeaking.emit(True)
+            try:
+                speak(reply)
+            finally:
+                self.setSpeaking.emit(False)
+
+        threading.Thread(target=one_shot, daemon=True).start()
+
+    # ------------------------------
+    # mute toggle (persisted)
+    # ------------------------------
     def on_mic_muted(self):
-        self._set_listening(False)
-        self._pulse_on(False)
-        self._stop_mic_stream()
-        self.chat_append("🔕 Mic muted.")
-        self.micMuted.emit()
+        current = get_config("muted", False)
+        new = not current
+        set_config("muted", new)
+        self._apply_mute_ui(new)
+        if new:
+            # stop auto-listen
+            self.stop_background_listening()
+            self.appendChat.emit("🔇 Microphone muted. Automatic listening stopped.")
+        else:
+            # resume
+            ensure_provider_env()
+            self.start_background_listening()
+            self.appendChat.emit("🔊 Microphone unmuted. Automatic listening resumed.")
 
-    def on_mic_stopped(self):
-        self._set_listening(False)
-        self._pulse_on(False)
-        self._stop_mic_stream()
-        self.chat_append("⏹️ Stopped listening.")
-        self.micStopped.emit()
+    def _apply_mute_ui(self, muted: bool):
+        if muted:
+            self.muteBtn.setText("🔇")
+            self.muteBtn.setToolTip("Unmute")
+        else:
+            self.muteBtn.setText("🔊")
+            self.muteBtn.setToolTip("Mute")
 
+    # ------------------------------
+    # send typed text
+    # ------------------------------
     def _send_text(self):
         text = self.input.text().strip()
         if not text:
             return
-        self.chat_append(f"🧑 You: {text}")
         self.input.clear()
+        self.appendChat.emit(f"🧑 You: {text}")
 
-        def run_backend():
+        def worker():
             try:
+                ensure_provider_env()
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                result = loop.run_until_complete(respond(text))
-                loop.close()
-
-                QtCore.QMetaObject.invokeMethod(
-                    self, 
-                    lambda: self.chat_append(f"🟣 {get_config('assistant_name','Luna').capitalize()}: {result}"),
-                    QtCore.Qt.ConnectionType.QueuedConnection
-                )
-
-                # visualize TTS by receiving audio chunks from speak()
-                def ui_chunk_callback(arr):
-                    rms = float(np.sqrt(np.mean(np.square(arr))))
-                    QtCore.QMetaObject.invokeMethod(self, lambda: self.wave.set_level(rms), QtCore.Qt.ConnectionType.QueuedConnection)
-
-                speak(result, on_audio_chunk=ui_chunk_callback)
-            except Exception as e:
-                QtCore.QMetaObject.invokeMethod(self, lambda: self.chat_append(f"⚠️ Error: {e}"), QtCore.Qt.ConnectionType.QueuedConnection)
-
-        threading.Thread(target=run_backend, daemon=True).start()
-
-    # ------------------------------
-    # Mic visualization stream
-    # ------------------------------
-    def _start_mic_stream(self):
-        if self._listening_stream is not None:
-            return
-        try:
-            # callback receives indata (numpy array), frames, time, status
-            def cb(indata, frames, time_info, status):
-                if status:
-                    pass  # you could log status
-                # compute RMS of input (mono)
                 try:
-                    if indata.ndim > 1:
-                        mono = np.mean(indata, axis=1)
-                    else:
-                        mono = indata
-                    rms = float(np.sqrt(np.mean(np.square(mono))))
-                except Exception:
-                    rms = 0.0
-                
-                QtCore.QMetaObject.invokeMethod(
-                    self, "update_wave_level",
-                    QtCore.Qt.ConnectionType.QueuedConnection,
-                    QtCore.Q_ARG(float, rms)
-                )
+                    reply = loop.run_until_complete(respond(text))
+                finally:
+                    loop.close()
+                self.appendChat.emit(f"🤖 {nice_name(get_config('assistant_name','Luna'))}: {reply}")
+                # speaking animation
+                self.setSpeaking.emit(True)
+                try:
+                    speak(reply)
+                finally:
+                    self.setSpeaking.emit(False)
+            except Exception as e:
+                self.appendChat.emit(f"⚠️ Assistant error: {e}")
 
-            self._listening_stream = sd.InputStream(callback=cb, channels=1, samplerate=16000)
-            self._listening_stream.start()
-        except Exception as e:
-            print("Failed to start mic stream:", e)
-            self._listening_stream = None
+        threading.Thread(target=worker, daemon=True).start()
 
-    def _stop_mic_stream(self):
+    # ------------------------------
+    # clean shutdown
+    # ------------------------------
+    def _close_app(self):
+        # stop background listener + workers + stt thread
+        self._stt_running = False
         try:
-            if self._listening_stream is not None:
-                self._listening_stream.stop()
-                self._listening_stream.close()
+            self.stop_background_listening()
         except Exception:
             pass
-        finally:
-            self._listening_stream = None
-            # ensure bars flatten
-            self.wave.stop()
+        try:
+            self._stop_mic_worker()
+        except Exception:
+            pass
+        # clear queue to let thread exit faster
+        with self._stt_queue.mutex:
+            self._stt_queue.queue.clear()
+        QtWidgets.QApplication.quit()
 
-    # ------------------------------
-    # UI State
-    # ------------------------------
-    def chat_append(self, line: str):
-        self.chat.append(line)
-        self.chat.verticalScrollBar().setValue(self.chat.verticalScrollBar().maximum())
+    def closeEvent(self, e):
+        self._close_app()
+        return super().closeEvent(e)
 
-    def _set_listening(self, on: bool):
-        if on:
-            self.listeningLbl.setText("Listening…")
-            self.wave.start()
-        else:
-            self.listeningLbl.setText("Ready.")
-            self.wave.stop()
-
-    # ------------------------------
-    # Window Dragging
-    # ------------------------------
-    def mousePressEvent(self, event):
-        if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            event.accept()
-
-    def mouseMoveEvent(self, event):
-        if self._drag_pos and event.buttons() & QtCore.Qt.MouseButton.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
-            event.accept()
-
-    def mouseReleaseEvent(self, event):
-        self._drag_pos = None
-
-    # ------------------------------
-    # Animations
-    # ------------------------------
-    def _init_animations(self):
-        self.anim = QtCore.QPropertyAnimation(self, b"windowOpacity")
-        self.anim.setDuration(700)
-        self.anim.setStartValue(0.0)
-        self.anim.setEndValue(1.0)
-        self.anim.setEasingCurve(QtCore.QEasingCurve.Type.InOutQuad)
-        self.anim.start()
-
-        self.pulseShadow = QtWidgets.QGraphicsDropShadowEffect(self.micBtn)
-        self.pulseShadow.setBlurRadius(0)
-        self.pulseShadow.setOffset(0, 0)
-        self.pulseShadow.setColor(QtGui.QColor("#00e5ff"))
-        self.micBtn.setGraphicsEffect(self.pulseShadow)
-
-        self.pulse = QtCore.QPropertyAnimation(self.pulseShadow, b"blurRadius")
-        self.pulse.setDuration(800)
-        self.pulse.setStartValue(10)
-        self.pulse.setEndValue(35)
-        self.pulse.setEasingCurve(QtCore.QEasingCurve.Type.InOutQuad)
-        self.pulse.setLoopCount(-1)
-
-    def _pulse_on(self, on: bool):
-        if on and self.pulse.state() != QtCore.QAbstractAnimation.State.Running:
-            self.pulse.start()
-        elif not on and self.pulse.state() == QtCore.QAbstractAnimation.State.Running:
-            self.pulse.stop()
-            self.pulseShadow.setBlurRadius(0)
-
-    # ------------------------------
-    # Styling
-    # ------------------------------
-    def _apply_style(self):
-        self.setStyleSheet("""
-            QWidget#bg {
-                background: qlineargradient(
-                    x1:0, y1:0, x2:1, y2:1,
-                    stop:0 rgba(20, 20, 35, 220),
-                    stop:1 rgba(10, 6, 18, 180)
-                );
-                border: 1px solid rgba(255,255,255,30);
-                border-radius: 14px;
-            }
-            QLabel#title {
-                color: #ccf9ff;
-                font-size: 30px;
-                font-weight: 700;
-                font-family: "Orbitron", "Montserrat", "Segoe UI", Arial;
-                letter-spacing: 1px;
-            }
-            QTextEdit#chat {
-                color: rgba(240, 248, 255, 230);
-                background: rgba(255,255,255,0.03);
-                border: 1px solid rgba(255,255,255,0.06);
-                border-radius: 10px;
-                padding: 10px 12px;
-                font-size: 13px;
-            }
-            QLineEdit#input {
-                color: rgba(240, 248, 255, 230);
-                background: rgba(255,255,255,0.04);
-                border: 1px solid rgba(255,255,255,0.10);
-                border-radius: 8px;
-                padding: 8px 10px;
-                font-size: 13px;
-            }
-            QLabel#listening {
-                color: #aab7ff;
-                font-size: 13px;
-            }
-            QPushButton#micBtn {
-                color: #00e5ff;
-                background: qradialgradient(cx:0.5, cy:0.5, radius:0.5,
-                    fx:0.5, fy:0.5,
-                    stop:0 rgba(0, 229, 255, 120),
-                    stop:1 rgba(167, 139, 250, 90)
-                );
-                border: 1px solid rgba(255,255,255, 40);
-                border-radius: 40px;
-            }
-            QPushButton#closeBtn {
-                background: rgba(255,255,255,0.03);
-                border: none;
-                border-radius: 6px;
-            }
-            QPushButton#closeBtn:hover {
-                background: rgba(255,50,50,0.18);
-            }
-            QPushButton#muteBtn, QPushButton#stopBtn {
-                color: #c8a6ff;
-                background: rgba(255,255,255,0.07);
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 10px;
-            }
-        """)
 
 # ------------------------------
-# App Entry
+# Entrypoint
 # ------------------------------
 def main():
-    QtCore.QCoreApplication.setAttribute(QtCore.Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
-    QtCore.QCoreApplication.setAttribute(QtCore.Qt.ApplicationAttribute.AA_EnableHighDpiScaling)
-
     app = QtWidgets.QApplication(sys.argv)
-    app.setWindowIcon(make_icon(fallback_char="◌", size=64))
-
     win = LunaUI()
     win.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
