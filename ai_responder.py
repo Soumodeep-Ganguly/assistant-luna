@@ -221,3 +221,60 @@ async def ask_ai(command, provider="ollama", model=None):
             "action": "none",
             "parameters": {},
         }
+    
+
+async def validate_ai(provider="ollama", model=None):
+    """
+    Query AI provider and return normalized JSON response.
+    provider: "ollama" | "openai" | "groq" | "openrouter"
+    """
+    try:
+        messages = [{"role": "user", "content": "hi"}]
+
+        # ---------------- Provider routing ---------------- #
+        if provider == "ollama":
+            model = model or "gemma3:1b"
+            result = ollama.chat(model=model, messages=messages)
+            content = result["message"]["content"]
+            if content:
+                return True
+            
+            return False
+
+        elif provider in ("openai", "groq", "openrouter"):
+            if OpenAI is None:
+                raise ImportError("openai package not installed")
+
+            if provider == "openai":
+                api_key = os.getenv("OPENAI_API_KEY")
+                base_url = None
+                model = model or "gpt-4o-mini"
+            elif provider == "groq":
+                api_key = os.getenv("GROQ_API_KEY")
+                base_url = "https://api.groq.com/openai/v1"
+                model = model or "openai/gpt-oss-20b"
+            elif provider == "openrouter":
+                api_key = os.getenv("OPENROUTER_API_KEY")
+                base_url = "https://openrouter.ai/api/v1"
+                model = model or "anthropic/claude-3.5-sonnet"
+
+            client = OpenAI(api_key=api_key, base_url=base_url)
+
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages
+            )
+
+            msg = response.choices[0].message
+
+            if (msg.content):
+                return True
+
+            return False
+        
+        else:
+            return False
+    
+    except Exception as e:
+        print(f"Error validating with {provider}: {e}")
+        return False
