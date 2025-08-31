@@ -6,7 +6,8 @@ import queue
 import threading
 import asyncio
 import numpy as np
-
+import ctypes
+from ctypes import wintypes
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import sounddevice as sd
@@ -277,7 +278,7 @@ class LunaUI(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.resize(1000, 680)
-        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
+
         self.setWindowFlags(
             QtCore.Qt.WindowType.FramelessWindowHint |
             QtCore.Qt.WindowType.WindowSystemMenuHint
@@ -289,22 +290,42 @@ class LunaUI(QtWidgets.QMainWindow):
         # UI layout (keeps the futuristic look you already had)
         root = QtWidgets.QWidget()
         self.setCentralWidget(root)
+
+
+        # Apply platform-specific background
+        if sys.platform == "win32":
+            self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
+            self._enable_windows_blur(acrylic=True)
+        elif sys.platform == "darwin":
+            self.setAttribute(Qt.WA_TranslucentBackground)
+            self._enable_macos_blur()
+        else:
+            # Linux → keep it opaque
+            self._set_linux_background("#181b20")
+        
+
         v = QtWidgets.QVBoxLayout(root)
         v.setContentsMargins(12, 12, 12, 12)
 
         # title row
         tr = QtWidgets.QHBoxLayout()
         self.settingsBtn = QtWidgets.QPushButton("⚙")
-        self.settingsBtn.setFixedSize(34, 34)
+
+        f = self.settingsBtn.font()
+        f.setPointSize(25)
+        self.settingsBtn.setFont(f)
+
+        self.settingsBtn.setFixedSize(44, 44)
         self.settingsBtn.clicked.connect(self.open_settings)
 
         self.titleLabel = QtWidgets.QLabel(assistant)
         self.titleLabel.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.titleLabel.setObjectName("title")
 
-        self.closeBtn = QtWidgets.QPushButton("✕")
+        self.closeBtn = QtWidgets.QPushButton("×")
         self.closeBtn.setFixedSize(34, 34)
         self.closeBtn.clicked.connect(self._close_app)
+        self.closeBtn.setFont(f)
 
         tr.addWidget(self.settingsBtn)
         tr.addWidget(self.titleLabel, 1)
@@ -328,10 +349,12 @@ class LunaUI(QtWidgets.QMainWindow):
         controls.addStretch(1)
         self.muteBtn = QtWidgets.QPushButton()
         self.muteBtn.setFixedSize(48, 48)
+        self.muteBtn.setFont(f)
         self.muteBtn.clicked.connect(self.on_mic_muted)
         controls.addWidget(self.muteBtn)
         self.manualMicBtn = QtWidgets.QPushButton("🎤")
         self.manualMicBtn.setFixedSize(56, 56)
+        self.manualMicBtn.setFont(f)
         self.manualMicBtn.clicked.connect(self._manual_capture)
         controls.addWidget(self.manualMicBtn)
         controls.addStretch(1)
@@ -423,6 +446,80 @@ class LunaUI(QtWidgets.QMainWindow):
         # clear queue (optional)
         with self._stt_queue.mutex:
             self._stt_queue.queue.clear()
+
+    def _enable_windows_blur(self, acrylic=False):
+        class ACCENTPOLICY(ctypes.Structure):
+            _fields_ = [
+                ("AccentState", wintypes.DWORD),
+                ("Flags", wintypes.DWORD),
+                ("GradientColor", wintypes.DWORD),
+                ("AnimationId", wintypes.DWORD)
+            ]
+
+        class WINCOMPATTRDATA(ctypes.Structure):
+            _fields_ = [
+                ("Attribute", wintypes.DWORD),
+                ("Data", ctypes.POINTER(ACCENTPOLICY)),
+                ("SizeOfData", wintypes.UINT)
+            ]
+
+        SetWindowCompositionAttribute = ctypes.windll.user32.SetWindowCompositionAttribute
+        SetWindowCompositionAttribute.restype = wintypes.BOOL
+
+        ACCENT_ENABLE_BLURBEHIND = 3
+        ACCENT_ENABLE_ACRYLIC = 4
+        WCA_ACCENT_POLICY = 19
+
+        accent = ACCENTPOLICY()
+        accent.AccentState = ACCENT_ENABLE_ACRYLIC if acrylic else ACCENT_ENABLE_BLURBEHIND
+        accent.GradientColor = 0x99FFFFFF  # alpha=0x99, RGB=FFFFFF
+
+        data = WINCOMPATTRDATA()
+        data.Attribute = WCA_ACCENT_POLICY
+        data.Data = ctypes.pointer(accent)
+        data.SizeOfData = ctypes.sizeof(accent)
+
+        hwnd = int(self.winId())
+        SetWindowCompositionAttribute(hwnd, ctypes.byref(data))
+
+    # --- macOS blur implementation ---
+    def _enable_macos_blur(self):
+        from ctypes import cdll, c_void_p, c_uint, c_bool
+
+        appkit = cdll.LoadLibrary("/System/Library/Frameworks/AppKit.framework/AppKit")
+        objc = cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+
+        objc.objc_getClass.restype = c_void_p
+        objc.sel_registerName.restype = c_void_p
+        objc.objc_msgSend.restype = c_void_p
+
+        NSVisualEffectView = objc.objc_getClass(b"NSVisualEffectView")
+        alloc = objc.sel_registerName(b"alloc")
+        init = objc.sel_registerName(b"init")
+        setState = objc.sel_registerName(b"setState:")
+        setMaterial = objc.sel_registerName(b"setMaterial:")
+
+        # Create effect view
+        view = objc.objc_msgSend(NSVisualEffectView, alloc)
+        view = objc.objc_msgSend(view, init)
+
+        # 1 = active
+        objc.objc_msgSend(view, setState, 1)
+        # 0 = Appearance-based / 1=Light / 2=Dark / 3=Titlebar / 8=Sidebar
+        objc.objc_msgSend(view, setMaterial, 1)
+
+        # Attach it to our NSWindow’s content view
+        ns_win = self.winId().__int__()
+        contentView = objc.objc_msgSend(ns_win, objc.sel_registerName(b"contentView"))
+        objc.objc_msgSend(contentView, objc.sel_registerName(b"addSubview:"), view)
+
+    # --- Linux fallback ---
+    def _set_linux_background(self, hexcolor: str):
+        palette = self.palette()
+        palette.setColor(QtGui.QPalette.Window, QtGui.QColor(hexcolor))
+        self.setAutoFillBackground(True)
+        self.setPalette(palette)
+
 
     def _bg_callback(self, recognizer, audio):
         # called on listen_in_background thread; push audio to queue for sequential processing
