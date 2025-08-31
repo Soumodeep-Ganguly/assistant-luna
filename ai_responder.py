@@ -9,10 +9,9 @@ from database import get_config
 import ollama
 from openai import OpenAI
 
-MCP_SERVER_URL = "http://127.0.0.1:3001"  # wherever your MCP server runs
+MCP_SERVER_URL = "http://127.0.0.1:3001/sse"  # wherever your MCP server runs
 
 mcp_client = Client(MCP_SERVER_URL)
-
 
 
 # ---------------- JSON Handling ---------------- #
@@ -72,6 +71,21 @@ def extract_json(text):
             "action": "none",
             "parameters": {}
         }
+    
+
+def format_tools_for_openai(tools_list):
+    """Convert MCP tools into OpenAI-compatible function calling schema."""
+    formatted = []
+    for t in tools_list:
+        formatted.append({
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description or "",
+                "parameters": t.inputSchema or {"type": "object", "properties": {}}
+            }
+        })
+    return formatted
 
 
 # ---------------- Generic AI Query ---------------- #
@@ -121,7 +135,7 @@ async def ask_ai(command, provider="ollama", model=None):
                 if parsed["action"] != "none":
                     try:
                         tool_call = { "name": parsed["action"], "arguments": parsed["parameters"] }
-                        result = mcp_client.execute_tool(tool_call)
+                        result = await mcp_client.call_tool(parsed["action"], parsed["parameters"])
                         parsed["reply"] = str(result)
                     except Exception as e:
                         parsed["reply"] = f"Failed to execute {parsed['action']}: {e}"
@@ -148,10 +162,14 @@ async def ask_ai(command, provider="ollama", model=None):
                 client = OpenAI(api_key=api_key, base_url=base_url)
 
                 tools_list = await mcp_client.list_tools()
+                formatted_tools = format_tools_for_openai(tools_list)
+
+                print("TEST TOOLS LIST ", formatted_tools)
+
                 response = client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    tools=tools_list if mcp_client else None,
+                    tools=formatted_tools if mcp_client else None,
                     tool_choice="auto" if mcp_client else None,
                 )
 
@@ -160,11 +178,30 @@ async def ask_ai(command, provider="ollama", model=None):
                 # Check if AI made a tool call
                 if msg.tool_calls:
                     tool_call = msg.tool_calls[0]
-                    result = mcp_client.execute_tool(tool_call)
+
+                    tool_name = tool_call.function.name
+                    arguments = tool_call.function.arguments
+
+                    # Convert arguments to dict if it's a JSON string
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except Exception:
+                            arguments = {}
+
+                    result = await mcp_client.call_tool(tool_name, arguments)
+
+                    if "CallToolResult" in str(result):
+                        # try to extract the text inside
+                        if hasattr(result, "content"):
+                            result = result.content[0].text if result.content else str(result)
+                        else:
+                            result = str(result)
+
                     return {
                         "reply": str(result),
-                        "action": tool_call.name,
-                        "parameters": tool_call.arguments,
+                        "action": tool_name,
+                        "parameters": arguments,
                     }
 
                 # Fallback normal reply

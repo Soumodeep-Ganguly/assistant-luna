@@ -8,4 +8,5 @@ async def respond(command):
     print("DEBUG INFO ", parsed)
 
     reply = parsed.get("reply", "Sorry, I don't know how to respond.")
+            
     speak(reply)
