@@ -223,7 +223,7 @@ async def ask_ai(command, provider="ollama", model=None):
         }
     
 
-async def validate_ai(provider="ollama", model=None):
+async def validate_ai(provider="ollama", api_key=None, model=None):
     """
     Query AI provider and return normalized JSON response.
     provider: "ollama" | "openai" | "groq" | "openrouter"
@@ -246,15 +246,12 @@ async def validate_ai(provider="ollama", model=None):
                 raise ImportError("openai package not installed")
 
             if provider == "openai":
-                api_key = os.getenv("OPENAI_API_KEY")
                 base_url = None
                 model = model or "gpt-4o-mini"
             elif provider == "groq":
-                api_key = os.getenv("GROQ_API_KEY")
                 base_url = "https://api.groq.com/openai/v1"
                 model = model or "openai/gpt-oss-20b"
             elif provider == "openrouter":
-                api_key = os.getenv("OPENROUTER_API_KEY")
                 base_url = "https://openrouter.ai/api/v1"
                 model = model or "anthropic/claude-3.5-sonnet"
 
