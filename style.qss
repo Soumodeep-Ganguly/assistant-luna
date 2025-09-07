@@ -1,0 +1,95 @@
+/* Global */
+QWidget {
+    background-color: #011627;
+    color: #ffffff;
+    font-family: "Segoe UI", "Roboto", sans-serif;
+    font-size: 14px;
+}
+
+/* Buttons */
+QPushButton {
+    background-color: #20A4F3;
+    color: #ffffff;
+    border: none;
+    border-radius: 6px;
+    padding: 12px;
+}
+
+QPushButton:hover {
+    background-color: #1B8AD1;
+}
+QPushButton:pressed {
+    background-color: #1472AB;
+}
+QPushButton:disabled {
+    background-color: #2E3B4E;
+    color: #7A8A99;
+}
+
+QLabel[variant="heading"] {
+	qproperty-alignment: 'AlignCenter';
+	font-size: 25px;
+	text-align: center;
+	width: 100%;
+}
+
+/* Secondary (can be applied by property: button.setProperty("type", "secondary")) */
+QPushButton[type="secondary"] {
+    background-color: #FF3366;
+}
+QPushButton[type="secondary"]:hover {
+    background-color: #E02D5A;
+}
+QPushButton[type="secondary"]:pressed {
+    background-color: #B32247;
+}
+
+/* Line Edits */
+QLineEdit {
+    background-color: #0B253A;
+    border: 1px solid #2E3B4E;
+    border-radius: 4px;
+    padding: 8px;
+    color: #ffffff;
+    selection-background-color: #20A4F3;
+}
+
+/* Labels */
+QLabel {
+    color: #ffffff;
+}
+
+/* ComboBox */
+QComboBox {
+    background-color: #0B253A;
+    border: 1px solid #2E3B4E;
+    border-radius: 4px;
+    padding: 8px;
+}
+QComboBox::drop-down {
+    border: none;
+    background: transparent;
+}
+QComboBox::down-arrow {
+    image: url(down_arrow.png); /* optional */
+}
+
+/* Scrollbars */
+QScrollBar:vertical {
+    background: #011627;
+    width: 10px;
+    margin: 0px;
+}
+QScrollBar::handle:vertical {
+    background: #20A4F3;
+    border-radius: 5px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #1B8AD1;
+}
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    background: none;
+    border: none;
+}
+
